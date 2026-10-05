@@ -79,6 +79,7 @@ from sanic.models.futures import (
 )
 from sanic.models.handler_types import ListenerType, MiddlewareType
 from sanic.models.handler_types import Sanic as SanicVar
+from sanic.persistent_tasks import PersistentTaskManager
 from sanic.request import Request
 from sanic.response import BaseHTTPResponse, HTTPResponse, ResponseStream
 from sanic.router import Router
@@ -97,6 +98,9 @@ if TYPE_CHECKING:
         from sanic_ext.extensions.base import Extension  # type: ignore
     except ImportError:
         Extend = TypeVar("Extend", type)  # type: ignore
+
+    from sanic.persistent_tasks import TaskHandler
+    from sanic.task_store import TaskState, TaskStore
 
 
 if OS_IS_WINDOWS:  # no cov
@@ -139,6 +143,7 @@ class Sanic(
         "_future_statics",
         "_inspector",
         "_manager",
+        "_persistent_tasks",
         "_state",
         "_task_registry",
         "_test_client",
@@ -302,6 +307,7 @@ class Sanic(
         self._future_registry: FutureRegistry = FutureRegistry()
         self._inspector: Inspector | None = None
         self._manager: WorkerManager | None = None
+        self._persistent_tasks: PersistentTaskManager | None = None
         self._state: ApplicationState = ApplicationState(app=self)
         self._task_registry: dict[str, Task | None] = {}
         self._test_client: Any = None
@@ -1482,6 +1488,160 @@ class Sanic(
             for task in iter(self._task_registry.values())
             if task is not None
         )
+
+    # -------------------------------------------------------------------- #
+    # Persistent task management
+    # -------------------------------------------------------------------- #
+
+    def enable_persistent_tasks(
+        self,
+        store: "TaskStore | str | Path | None" = None,
+        *,
+        lease_timeout: float | None = None,
+        lease_refresh_interval: float | None = None,
+        poll_interval: float | None = None,
+        auto_recover: bool = True,
+    ) -> PersistentTaskManager:
+        """启用持久任务管理并返回管理器。
+
+        ``store`` 可为 :class:`TaskStore`、存储文件路径，省略时
+        使用 ``config.TASK_STORE_PATH``，仍未配置则在工作目录下的
+        ``.sanic`` 目录中按应用名创建存储文件。
+
+        启用后，应用启动后会自动把租约过期的任务接管回本进程；
+        普通 :meth:`add_task` 的轻量任务不受影响。
+        """
+        if self._persistent_tasks is not None:
+            return self._persistent_tasks
+
+        from sanic.task_store import TaskStore, get_or_create_store
+
+        if isinstance(store, TaskStore):
+            task_store = store
+        else:
+            path = store or self.config.TASK_STORE_PATH
+            if path is None:
+                path = (
+                    Path.cwd()
+                    / ".sanic"
+                    / f"task_store_{self.name}.json"
+                )
+            task_store = get_or_create_store(path)
+
+        manager = PersistentTaskManager(
+            self,
+            task_store,
+            lease_timeout=(
+                lease_timeout
+                if lease_timeout is not None
+                else self.config.TASK_LEASE_TIMEOUT
+            ),
+            lease_refresh_interval=(
+                lease_refresh_interval
+                if lease_refresh_interval is not None
+                else self.config.TASK_LEASE_REFRESH_INTERVAL
+            ),
+            poll_interval=(
+                poll_interval
+                if poll_interval is not None
+                else self.config.TASK_POLL_INTERVAL
+            ),
+        )
+        self._persistent_tasks = manager
+
+        if auto_recover:
+            @self.after_server_start
+            async def _recover_persistent_tasks(app: Sanic) -> None:
+                await app._persistent_tasks.recover()  # type: ignore
+
+            @self.after_server_stop
+            async def _close_persistent_tasks(app: Sanic) -> None:
+                if app._persistent_tasks is not None:
+                    await app._persistent_tasks.aclose(
+                        drain_timeout=app.config.GRACEFUL_SHUTDOWN_TIMEOUT
+                    )
+
+        return manager
+
+    @property
+    def persistent_tasks(self) -> PersistentTaskManager:
+        """持久任务管理器；未启用时抛出明确异常。"""
+        if self._persistent_tasks is None:
+            raise SanicException(
+                "Persistent tasks are not enabled. Call "
+                "app.enable_persistent_tasks() first, or set "
+                "config.TASK_STORE_PATH."
+            )
+        return self._persistent_tasks
+
+    def register_task_handler(
+        self, key: str, handler: "TaskHandler"
+    ) -> None:
+        """登记业务幂等键对应的作业，供执行与跨进程接管使用。"""
+        self.persistent_tasks.register_handler(key, handler)
+
+    async def submit_task(
+        self,
+        key: str,
+        handler: "TaskHandler | Coroutine[Any, Any, Any] | None" = None,
+        *,
+        name: str | None = None,
+        payload: dict[str, Any] | None = None,
+        lease_timeout: float | None = None,
+    ) -> Any:
+        """按业务幂等键提交运营作业。
+
+        同一幂等键的重复提交不会再次执行：执行中则等待，已完成
+        则返回首次结果，已失败则重放原异常，已取消则抛出
+        :class:`asyncio.CancelledError`。
+
+        ``payload`` 随状态持久化（须可 JSON 序列化），接管进程以
+        相同参数重放作业。
+        """
+        manager = self._persistent_tasks
+        if manager is None:
+            manager = self.enable_persistent_tasks()
+        return await manager.submit(
+            key,
+            handler,
+            name=name,
+            payload=payload,
+            lease_timeout=lease_timeout,
+        )
+
+    async def cancel_persistent_task(
+        self, key: str, msg: str | None = None
+    ) -> "TaskState":
+        """取消持久任务并等待终态落盘。
+
+        取消与完成/接管竞争时，先落盘的终态唯一生效。
+        """
+        return await self.persistent_tasks.cancel(key, msg=msg)
+
+    async def takeover_task(
+        self,
+        key: str,
+        handler: "TaskHandler | Coroutine[Any, Any, Any] | None" = None,
+        *,
+        force: bool = False,
+        lease_timeout: float | None = None,
+    ) -> Any:
+        """接管滞留或租约过期的持久任务并返回其结果。"""
+        return await self.persistent_tasks.takeover(
+            key, handler, force=force, lease_timeout=lease_timeout
+        )
+
+    async def recover_persistent_tasks(
+        self, **kwargs: Any
+    ) -> dict[str, Task[Any]]:
+        """恢复所有可接管任务（租约过期/受理滞留）到本进程执行。"""
+        return await self.persistent_tasks.recover(**kwargs)
+
+    def get_task_state(self, key: str) -> "TaskState | None":
+        """返回持久任务的当前持久状态，未启用或无记录时为 None。"""
+        if self._persistent_tasks is None:
+            return None
+        return self._persistent_tasks.get_state(key)
 
     # -------------------------------------------------------------------- #
     # ASGI

@@ -64,6 +64,10 @@ DEFAULT_CONFIG = {
     "REQUEST_MAX_SIZE": 100_000_000,
     "REQUEST_TIMEOUT": 60,
     "RESPONSE_TIMEOUT": 60,
+    "TASK_STORE_PATH": None,
+    "TASK_LEASE_TIMEOUT": 30.0,
+    "TASK_LEASE_REFRESH_INTERVAL": 10.0,
+    "TASK_POLL_INTERVAL": 0.25,
     "TLS_CERT_PASSWORD": "",  # nosec B105
     "TOUCHUP": _default,
     "USE_UVLOOP": _default,
@@ -132,6 +136,10 @@ class Config(dict, metaclass=DescriptorMeta):
     REQUEST_TIMEOUT: int
     RESPONSE_TIMEOUT: int
     SERVER_NAME: str
+    TASK_STORE_PATH: str | None
+    TASK_LEASE_TIMEOUT: float
+    TASK_LEASE_REFRESH_INTERVAL: float
+    TASK_POLL_INTERVAL: float
     TLS_CERT_PASSWORD: str
     TOUCHUP: Default | bool
     USE_UVLOOP: Default | bool
